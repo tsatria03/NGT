@@ -10,6 +10,7 @@
 #include <execinfo.h>
 #endif
 
+#include <Poco/UnicodeConverter.h>
 #include "obfuscate.h"
 #include "sound.h"
 #include <SRAL.h>
@@ -847,7 +848,14 @@ protected:
 	void handleCompile(const std::string& name, const std::string& value) {
 		m_opMode = OperationMode::COMPILE_SCRIPT;
 		m_scriptFileToProcess = value;
-		m_outputFile = "out.exe";
+		m_outputFile = std::filesystem::absolute(value).filename().string();
+		size_t pos = m_outputFile.find(".");
+		if (pos != std::string::npos) {
+			m_outputFile.erase(pos);
+		}
+#ifdef _WIN32
+		m_outputFile.append(".exe");
+#endif
 		stopOptionsProcessing();
 	}
 	void handleDumpApi(const std::string& name, const std::string& value) {
@@ -1018,13 +1026,12 @@ private:
 		LPVOID lpResLock = LockResource(hResLoad);
 		if (!lpResLock) {
 			FreeResource(hResLoad); return false;
-			DWORD dwSize = SizeofResource(hModule, hRes);
-			if (dwSize == 0) { UnlockResource(hResLoad); FreeResource(hResLoad); return false; } //Don't call FreeResource on success with LockResource
-
-			outBytecode.assign(static_cast<asBYTE*>(lpResLock), static_cast<asBYTE*>(lpResLock) + dwSize);
-			return true;
 		}
-		return false;
+		DWORD dwSize = SizeofResource(hModule, hRes);
+		if (dwSize == 0) { UnlockResource(hResLoad); FreeResource(hResLoad); return false; } //Don't call FreeResource on success with LockResource
+
+		outBytecode.assign(static_cast<asBYTE*>(lpResLock), static_cast<asBYTE*>(lpResLock) + dwSize);
+		return true;
 #else
 		std::ifstream file(exePath, std::ios::binary | std::ios::ate);
 		if (!file.is_open()) return false;
@@ -1056,12 +1063,13 @@ private:
 		}
 		return true;
 #endif
+		return true;
 	}
 
 	bool saveBytecodeToExecutableInternal(const std::string& targetPath, const std::vector<asBYTE>& bytecode) {
 		std::string hostExePath = get_exe_helper();
 		try {
-			std::filesystem::copy_file(hostExePath, targetPath);
+			std::filesystem::copy_file(hostExePath, targetPath, std::filesystem::copy_options::overwrite_existing);
 		}
 		catch (const std::filesystem::filesystem_error& e) {
 			std::cerr << "Error copying host executable: " << e.what() << std::endl;
@@ -1069,7 +1077,8 @@ private:
 		}
 
 #ifdef _WIN32
-		std::wstring targetPathW(targetPath.begin(), targetPath.end());
+		std::wstring targetPathW;
+		Poco::UnicodeConverter::convert(targetPath, targetPathW);
 		HANDLE hUpdate = BeginUpdateResourceW(targetPathW.c_str(), FALSE);
 		if (hUpdate == nullptr) {
 			std::cerr << "BeginUpdateResource failed: " << GetLastError() << std::endl;
