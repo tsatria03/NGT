@@ -2,10 +2,14 @@
 #define _WINSOCKAPI_   /* Prevent inclusion of winsock.h in windows.h */
 #include <excpt.h>
 #include <Windows.h>
-#pragma section(".NGT")
+// For PE Resource Update
+#pragma comment(lib, "Version.lib") // For GetFileVersionInfoSize, GetFileVersionInfo, VerQueryValue
 #else
 #include <unistd.h>
+#include <csignal>
+#include <execinfo.h>
 #endif
+
 #include "obfuscate.h"
 #include "sound.h"
 #include <SRAL.h>
@@ -20,6 +24,11 @@
 #include <Poco/Util/HelpFormatter.h>
 #include <Poco/Util/AbstractConfiguration.h>
 #include <Poco/AutoPtr.h>
+#include <Poco/Path.h>
+#include <Poco/Glob.h>
+#include <Poco/Exception.h>
+#include <Poco/StreamCopier.h>
+
 
 #include "debugger/debugger.h"
 #include "AES/aes.hpp"
@@ -36,23 +45,37 @@
 #include "scripthelper/scripthelper.h"
 #include "scriptmath/scriptmath.h"
 #include "scriptmath/scriptmathcomplex.h"
-
 #include "scriptstdstring/scriptstdstring.h"
 #include "scriptstdstring/scriptstdwstring.h"
-#include <assert.h>  // assert()
+
+#include <assert.h>
 #include <cstdlib>
 #include <fstream>
 #include <thread>
-#include <Poco/Glob.h>
-#include <Poco/Path.h>
-#include <Poco/Exception.h>
+#include <vector>
+#include <string>
+#include <sstream>
+#include <iostream> // For cout/cerr
+#include <algorithm> // For std::fill
+
+
 #define SDL_MAIN_HANDLED
 
-#define NGT_BYTECODE_ENCRYPTION_KEY "0Z1Eif2JShwWsaAfgw1EfiOwudDAnNg6WdsIuwyTgsJAiw(us)wjHdc87&6w()ErreOiduYRREoEiDKSodoWJritjH;kJ"
-#if defined(_MSC_VER)
-#include <crtdbg.h>   // MSVC debugging routines
+#define NGT_BYTECODE_ENCRYPTION_KEY "0Z1Eif2JShwWsaAfgw1EfiOwudDAnNg6WdsIuwyTgsJAiw(us)wjHdc87&6w()ErreOiduYRREoEiDKSodoWJritjH;kJSjwjifhaASfdfvV"
 
-// This class should be declared as a global singleton so the leak detection is initiated as soon as possible
+// Resource defines for Windows
+#ifdef _WIN32
+#define NGT_BYTECODE_RESOURCE_TYPE_W L"NGT_BYTECODE"
+#define NGT_BYTECODE_RESOURCE_ID_W   MAKEINTRESOURCE(1)
+#endif
+
+// Signature for appended bytecode on non-Windows
+const char* NGT_BYTECODE_FILE_SIGNATURE = "NGTBC_EOF";
+const size_t NGT_BYTECODE_FILE_SIGNATURE_LEN = strlen(NGT_BYTECODE_FILE_SIGNATURE);
+
+
+#if defined(_MSC_VER)
+#include <crtdbg.h>
 class MemoryLeakDetector
 {
 public:
@@ -61,28 +84,20 @@ public:
 		_CrtSetDbgFlag(_CRTDBG_LEAK_CHECK_DF | _CRTDBG_ALLOC_MEM_DF);
 		_CrtSetReportMode(_CRT_ASSERT, _CRTDBG_MODE_FILE);
 		_CrtSetReportFile(_CRT_ASSERT, _CRTDBG_FILE_STDERR);
-
-		// Use _CrtSetBreakAlloc(n) to find a specific memory leak
-		// Remember to "Enable Windows Debug Heap Allocator" in the debug options on MSVC2015. Without it
-		// enabled the memory allocation numbers shifts randomly from one execution to another making it
-		// impossible to predict the correct number for a specific allocation.
 		//_CrtSetBreakAlloc(124);
 	}
 } g_leakDetector;
 #endif
 
+
 #ifdef _WIN32
 #include <dbghelp.h>
-
 LONG WINAPI ExceptionHandler(EXCEPTION_POINTERS* exceptionInfo) {
 	std::stringstream ss;
 	ss << "Caught an access violation (segmentation fault)." << std::endl;
-
-	// Get the address where the exception occurred
 	ULONG_PTR faultingAddress = exceptionInfo->ExceptionRecord->ExceptionInformation[1];
-	ss << "Faulting address: " << faultingAddress << std::endl;
+	ss << "Faulting address: 0x" << std::hex << faultingAddress << std::dec << std::endl;
 
-	// Capture the stack trace
 	void* stack[100];
 	unsigned short frames;
 	SYMBOL_INFO* symbol;
@@ -90,41 +105,39 @@ LONG WINAPI ExceptionHandler(EXCEPTION_POINTERS* exceptionInfo) {
 
 	SymInitialize(process, NULL, TRUE);
 	frames = CaptureStackBackTrace(0, 100, stack, NULL);
-
 	symbol = (SYMBOL_INFO*)calloc(sizeof(SYMBOL_INFO) + 256 * sizeof(char), 1);
-	symbol->MaxNameLen = 255;
-	symbol->SizeOfStruct = sizeof(SYMBOL_INFO);
-
-	for (unsigned short i = 0; i < frames; i++) {
-		SymFromAddr(process, (DWORD64)(stack[i]), 0, symbol);
-		ss << i << ": " << symbol->Name << " - 0x" << number_to_hex_string(symbol->Address) << std::endl;
+	if (symbol) { // calloc can fail
+		symbol->MaxNameLen = 255;
+		symbol->SizeOfStruct = sizeof(SYMBOL_INFO);
+		for (unsigned short i = 0; i < frames; i++) {
+			SymFromAddr(process, (DWORD64)(stack[i]), 0, symbol);
+			ss << i << ": " << symbol->Name << " - 0x" << number_to_hex_string(symbol->Address) << std::endl;
+		}
+		free(symbol);
 	}
-
-	free(symbol);
+	else {
+		ss << "Failed to allocate memory for symbol information." << std::endl;
+	}
+	SymCleanup(process); // Cleanup symbol handler
 	alert("NGTRuntimeError", ss.str());
-	exit(1);
-	return 0;
+	// TerminateProcess is a forceful way to exit. Consider if a cleaner shutdown is possible.
+	// For a critical fault like this, TerminateProcess might be appropriate to prevent further corruption.
+	TerminateProcess(GetCurrentProcess(), 1);
+	return EXCEPTION_EXECUTE_HANDLER; // Should not be reached if TerminateProcess succeeds
 }
-
 #else
-#include <csignal>
-#include <execinfo.h>
 void signalHandler(int signal, siginfo_t* info, void* context) {
-	std::cout << "Caught SIGSEGV (Segmentation fault)." << std::endl;
-
+	std::cerr << "Caught signal " << signal << " (Segmentation fault)." << std::endl;
 	if (info) {
-		std::cout << "Faulting address: " << info->si_addr << std::endl;
+		std::cerr << "Faulting address: " << info->si_addr << std::endl;
 	}
-
-	void* array[10];
+	void* array[20]; // Increased buffer size
 	size_t size;
-
-	size = backtrace(array, 10);
+	size = backtrace(array, 20);
+	std::cerr << "Stack trace:" << std::endl;
 	backtrace_symbols_fd(array, size, STDERR_FILENO);
-
 	exit(1);
 }
-
 #endif
 
 using Poco::Util::Application;
@@ -134,655 +147,391 @@ using Poco::Util::HelpFormatter;
 using Poco::Util::AbstractConfiguration;
 using Poco::Util::OptionCallback;
 using Poco::AutoPtr;
-bool g_shutdown = false;
-int g_retcode = 0;
-static std::string get_exe_path();
-int IncludeCallback(const char* include, const char* from, CScriptBuilder* builder, void* userParam) {
-	// 1. Resolve the relative path
-	std::string absoluteIncludePath = Poco::Path(from).append("../" + std::string(include)).toString(); // Construct an absolute path
-	// 2. Try to find the file directly
-	if (builder->AddSectionFromFile(absoluteIncludePath.c_str()) > -1) {
-		g_ScriptMessagesError = "";
-		return 0;
-	}
 
-	// 3. Try the 'include' directory
-	std::string includeDirectoryPath = Poco::Path(get_exe_path() + "/include", include).toString();
-	if (builder->AddSectionFromFile(includeDirectoryPath.c_str()) > -1) {
-		g_ScriptMessagesError = "";
-		return 0;
-	}
+bool g_shutdown = false; // Consider managing this within application state
+int g_retcode = 0;      // Used by script's potential custom exit, review its necessity
 
-	// 4. Check for .as and .ngt extensions in both paths
-	std::string currentAsPath = absoluteIncludePath + ".as";
-	if (builder->AddSectionFromFile(currentAsPath.c_str()) > -1) {
-		g_ScriptMessagesError = "";
-		return 0;
-	}
-	std::string currentNgtPath = absoluteIncludePath + ".ngt";
-	if (builder->AddSectionFromFile(currentNgtPath.c_str()) > -1) {
-		g_ScriptMessagesError = "";
-		return 0;
-	}
-
-	std::string includeAsPath = includeDirectoryPath + ".as";
-	if (builder->AddSectionFromFile(includeAsPath.c_str()) > -1) {
-		g_ScriptMessagesError = "";
-		return 0;
-	}
-	std::string includeNgtPath = includeDirectoryPath + ".ngt";
-	if (builder->AddSectionFromFile(includeNgtPath.c_str()) > -1) {
-		g_ScriptMessagesError = "";
-		return 0;
-	}
-
-	// 5. Handle wildcards
-	std::set<std::string> matches;
-	Poco::Glob::glob(absoluteIncludePath, matches);
-	for (const auto& match : matches) {
-		builder->AddSectionFromFile(match.c_str());
-	}
-	Poco::Glob::glob(includeDirectoryPath, matches);
-	for (const auto& match : matches) {
-		builder->AddSectionFromFile(match.c_str());
-	}
-	return 0;
-}
-CScriptBuilder builder;
-static inline void crypt(std::vector<asBYTE>& bytes) {
-	for (size_t i = 0; i < bytes.size(); ++i) {
-		bytes[i] ^= bytes.size();
-	}
-}
-
-
-
-static std::string get_exe() {
-	return Poco::Util::Application::instance().config().getString("application.path");
-}
-static std::string get_exe_path() {
+static std::string get_exe_path_helper() {
 	return Poco::Util::Application::instance().config().getString("application.dir");
 }
 
-static std::vector<std::string> string_split(const std::string& delim, const std::string& str)
-{
-	std::vector<std::string> array;
-
-	if (delim.empty()) {
-		array.push_back(str);
-		return array;
-	}
-
-	size_t pos = 0, prev = 0;
-
-	while ((pos = str.find(delim, prev)) != std::string::npos)
-	{
-		array.push_back(str.substr(prev, pos - prev));
-		prev = pos + delim.length();
-	}
-
-	array.push_back(str.substr(prev));
-
-	return array;
-}
-
-std::vector<std::string> defines;
-static inline void TrimWhitespace(std::string& str) {
-	str.erase(0, str.find_first_not_of(" \t\r\n")); // Trim leading whitespace
-	str.erase(str.find_last_not_of(" \t\r\n") + 1); // Trim trailing whitespace
+static std::string get_exe_helper() {
+	return Poco::Util::Application::instance().config().getString("application.path");
 }
 
 
+int IncludeCallback(const char* include, const char* from, CScriptBuilder* builder, void* /*userParam*/) {
+	std::filesystem::path fromPath(from);
+	std::filesystem::path currentDir = fromPath.parent_path();
+	std::filesystem::path includePath(include);
 
-int PragmaCallback(const std::string& pragmaText, CScriptBuilder& builder, void* userParam) {
-	const std::string definePrefix = " define ";
+	std::vector<std::filesystem::path> pathsToTry;
 
-	if (pragmaText.starts_with(definePrefix)) {
-		std::string word = pragmaText.substr(definePrefix.length());
-		TrimWhitespace(word);
-		defines.push_back(word);
-		return 0;
+	// 1. Relative to current script file
+	pathsToTry.push_back(currentDir / includePath);
+
+	// 2. Relative to 'include' directory alongside executable
+	std::filesystem::path exeDir(get_exe_path_helper());
+	pathsToTry.push_back(exeDir / "include" / includePath);
+
+	// Extensions to try
+	const char* extensions[] = { "", ".as", ".ngt" };
+
+	for (const auto& basePath : pathsToTry) {
+		for (const char* ext : extensions) {
+			std::filesystem::path testPath = basePath;
+			if (strlen(ext) > 0 && basePath.extension() != ext) { // Avoid double extension if already present
+				testPath.replace_extension(ext);
+			}
+			// If no extension or trying "" extension, use original path
+			if (strlen(ext) == 0) testPath = basePath;
+
+
+			if (std::filesystem::exists(testPath) && std::filesystem::is_regular_file(testPath)) {
+				if (builder->AddSectionFromFile(testPath.string().c_str()) >= 0) {
+					g_ScriptMessagesError = "";
+					return 0;
+				}
+			}
+		}
+
+		// Handle wildcards (basic support, Poco::Glob is more powerful)
+		std::set<std::string> matches;
+		// Try globbing on the basePath as a pattern (if 'include' contained wildcards)
+		try {
+			Poco::Glob::glob(basePath.string(), matches);
+			bool added_any = false;
+			for (const auto& match : matches) {
+				if (std::filesystem::exists(match) && std::filesystem::is_regular_file(match)) {
+					if (builder->AddSectionFromFile(match.c_str()) >= 0) {
+						added_any = true;
+					}
+				}
+			}
+			if (added_any) {
+				g_ScriptMessagesError = "";
+				return 0;
+			}
+		}
+		catch (const Poco::Exception&) {
+		}
+
+		return -1; // File not found
 	}
 	return -1;
 }
 
-std::vector <asBYTE> buffer;
-asUINT buffer_size;
-bool SCRIPT_COMPILED = false;
-int               ExecSystemCmd(const string& cmd);
-int               ExecSystemCmd(const string& str, string& out);
-CScriptArray* GetCommandLineArgs();
-// The command line arguments
-CScriptArray* g_commandLineArgs = 0;
-int           g_argc = 0;
-char** g_argv = 0;
+static inline void TrimWhitespace(std::string& str) {
+	str.erase(0, str.find_first_not_of(" \t\r\n"));
+	str.erase(str.find_last_not_of(" \t\r\n") + 1);
+}
 
+int PragmaCallback(const std::string& pragmaText, CScriptBuilder& builder, void* /*userParam*/) {
+	const std::string definePrefix = "define ";
+	std::string text = pragmaText;
+	TrimWhitespace(text);
 
-void vector_pad(std::vector<unsigned char>& text) {
-	int padding_size = 16 - (text.size() % 16);
+	if (text.rfind(definePrefix, 0) == 0) {
+		std::string word = text.substr(definePrefix.length());
+		TrimWhitespace(word);
+		if (!word.empty()) {
+			builder.DefineWord(word.c_str());
+			return 0;
+		}
+	}
+	return -1;
+}
+
+// Bytecode manipulation: XOR "obfuscation"
+static inline void apply_simple_obfuscation(std::vector<asBYTE>& bytes) {
+	if (bytes.empty()) return; // Avoid issues with bytes.size() being 0 for XOR key
+	asBYTE key = static_cast<asBYTE>(bytes.size() & 0xFF); // Use (size % 256) as simple key
+	if (key == 0) key = 1; // Ensure key is not zero if size is a multiple of 256
+	for (size_t i = 0; i < bytes.size(); ++i) {
+		bytes[i] ^= key;
+	}
+}
+
+// AES Padding
+void vector_pad_aes(std::vector<unsigned char>& text) {
+	size_t padding_size = AES_BLOCKLEN - (text.size() % AES_BLOCKLEN);
 	if (padding_size == 0) {
-		padding_size = 16;
+		padding_size = AES_BLOCKLEN;
 	}
 	text.insert(text.end(), padding_size, static_cast<unsigned char>(padding_size));
 }
 
-void vector_unpad(std::vector<unsigned char>& text) {
-	int padding_size = static_cast<unsigned char>(text.back());
-	if (padding_size > 0 && padding_size <= 16) {
+void vector_unpad_aes(std::vector<unsigned char>& text) {
+	if (text.empty()) return;
+	size_t padding_size = static_cast<unsigned char>(text.back());
+	if (padding_size > 0 && padding_size <= AES_BLOCKLEN && padding_size <= text.size()) {
 		text.resize(text.size() - padding_size);
 	}
+	else {
+		std::cerr << "Warning: Invalid AES unpadding size detected: " << padding_size << std::endl;
+	}
 }
 
-static std::vector<unsigned char> vector_encrypt(const std::vector<unsigned char>& str, const std::string& encryption_key) {
-	std::vector<unsigned char> the_vector = str;
-	Poco::SHA2Engine hash;
-	hash.update(encryption_key);
-	const unsigned char* key_hash = hash.digest().data();
+// AES Encryption/Decryption
+static std::vector<unsigned char> aes_encrypt_vector(const std::vector<unsigned char>& data, const std::string& encryption_key_material) {
+	std::vector<unsigned char> result_data = data;
+	Poco::SHA2Engine hash(Poco::SHA2Engine::SHA_256);
+	hash.update(encryption_key_material);
+	const Poco::DigestEngine::Digest& key_digest_vec = hash.digest();
+	const unsigned char* aes_key = key_digest_vec.data();
 
-	unsigned char iv[16];
-	for (int i = 0; i < 16; ++i) {
-		iv[i] = key_hash[i * 2] ^ (4 * i + 1);
+	unsigned char iv[AES_BLOCKLEN];
+	for (int i = 0; i < AES_BLOCKLEN; ++i) {
+		// Simple IV derivation from hash, ensure it's different from key parts if possible
+		iv[i] = key_digest_vec[(i * 2) % key_digest_vec.size()] ^ static_cast<unsigned char>(4 * i + 1);
 	}
 
-	AES_ctx crypt;
-	AES_init_ctx_iv(&crypt, key_hash, iv);
-	vector_pad(the_vector);
-	AES_CBC_encrypt_buffer(&crypt, the_vector.data(), the_vector.size());
+	AES_ctx crypt_ctx;
+	AES_init_ctx_iv(&crypt_ctx, aes_key, iv);
 
-	// Clear sensitive data
+	vector_pad_aes(result_data);
+	AES_CBC_encrypt_buffer(&crypt_ctx, result_data.data(), result_data.size());
+
 	std::fill(std::begin(iv), std::end(iv), 0);
-	std::fill(reinterpret_cast<uint8_t*>(&crypt), reinterpret_cast<uint8_t*>(&crypt) + sizeof(AES_ctx), 0);
-
-	return the_vector;
+	std::fill(reinterpret_cast<uint8_t*>(&crypt_ctx), reinterpret_cast<uint8_t*>(&crypt_ctx) + sizeof(AES_ctx), 0);
+	return result_data;
 }
 
-static std::vector<unsigned char> vector_decrypt(const std::vector<unsigned char>& str, const std::string& encryption_key) {
-	if (str.size() % 16 != 0) return {};
-
-	std::vector<unsigned char> the_vector = str;
-	Poco::SHA2Engine hash;
-	hash.update(encryption_key);
-	const unsigned char* key_hash = hash.digest().data();
-
-	unsigned char iv[16];
-	for (int i = 0; i < 16; ++i) {
-		iv[i] = key_hash[i * 2] ^ (4 * i + 1);
+static std::vector<unsigned char> aes_decrypt_vector(const std::vector<unsigned char>& encrypted_data, const std::string& encryption_key_material) {
+	if (encrypted_data.empty() || encrypted_data.size() % AES_BLOCKLEN != 0) {
+		std::cerr << "Error: Encrypted data size is invalid for AES decryption." << std::endl;
+		return {};
 	}
 
-	AES_ctx crypt;
-	AES_init_ctx_iv(&crypt, key_hash, iv);
-	AES_CBC_decrypt_buffer(&crypt, the_vector.data(), the_vector.size());
+	std::vector<unsigned char> result_data = encrypted_data;
+	Poco::SHA2Engine hash(Poco::SHA2Engine::SHA_256);
+	hash.update(encryption_key_material);
+	const Poco::DigestEngine::Digest& key_digest_vec = hash.digest();
+	const unsigned char* aes_key = key_digest_vec.data();
 
-	// Clear sensitive data
+	unsigned char iv[AES_BLOCKLEN];
+	for (int i = 0; i < AES_BLOCKLEN; ++i) {
+		iv[i] = key_digest_vec[(i * 2) % key_digest_vec.size()] ^ static_cast<unsigned char>(4 * i + 1);
+	}
+
+	AES_ctx crypt_ctx;
+	AES_init_ctx_iv(&crypt_ctx, aes_key, iv);
+	AES_CBC_decrypt_buffer(&crypt_ctx, result_data.data(), result_data.size());
+
 	std::fill(std::begin(iv), std::end(iv), 0);
-	std::fill(reinterpret_cast<uint8_t*>(&crypt), reinterpret_cast<uint8_t*>(&crypt) + sizeof(AES_ctx), 0);
+	std::fill(reinterpret_cast<uint8_t*>(&crypt_ctx), reinterpret_cast<uint8_t*>(&crypt_ctx) + sizeof(AES_ctx), 0);
 
-	vector_unpad(the_vector);
-	return the_vector;
+	vector_unpad_aes(result_data);
+	return result_data;
 }
+
 
 void ScriptAssert(bool expr, const std::string& fail_text = "") {
 	if (!expr) throw Poco::AssertionViolationException(fail_text);
 }
 
-
-#ifdef _WIN32
-__declspec(allocate(".NGT")) class CBytecodeStream : public asIBinaryStream
-#else
 class CBytecodeStream : public asIBinaryStream
-#endif
 {
 public:
 	std::vector<asBYTE> Code;
 	int ReadPos, WritePos;
 
-public:
-	CBytecodeStream() : ReadPos(0), WritePos(0)
-	{
-	}
+	CBytecodeStream() : ReadPos(0), WritePos(0) {}
+	CBytecodeStream(const std::vector<asBYTE>& Data) : Code(Data), ReadPos(0), WritePos(0) {}
 
-	CBytecodeStream(const std::vector<asBYTE>& Data) : Code(Data), ReadPos(0), WritePos(0)
-	{
-	}
-
-	int Read(void* Ptr, asUINT Size) override
-	{
-		if (Ptr == nullptr || Size == 0)
-		{
-			return -1; // Error: corrupted read
-		}
-
-		if (ReadPos + Size > Code.size())
-		{
-			return -1; // Error: trying to read past end of stream
-		}
-
+	int Read(void* Ptr, asUINT Size) override {
+		if (Ptr == nullptr || Size == 0) return -1;
+		if (static_cast<asUINT>(ReadPos) + Size > Code.size()) return -1;
 		std::memcpy(Ptr, &Code[ReadPos], Size);
 		ReadPos += Size;
-
-		return 0;
+		return Size; // AngelScript examples return bytes read or 0 for success, docs say "Return the number of bytes read, or a negative value on error."
 	}
 
-	int Write(const void* Ptr, asUINT Size) override
-	{
-		if (Ptr == nullptr || Size == 0)
-		{
-			return -1; // Error: corrupted write
-		}
-
+	int Write(const void* Ptr, asUINT Size) override {
+		if (Ptr == nullptr || Size == 0) return -1;
 		Code.insert(Code.end(), static_cast<const asBYTE*>(Ptr), static_cast<const asBYTE*>(Ptr) + Size);
-		WritePos += Size;
-
-		return 0;
-	}
-
-	std::vector<asBYTE>& GetCode()
-	{
-		return Code;
-	}
-
-	asUINT GetSize() const
-	{
-		return static_cast<asUINT>(Code.size());
+		WritePos += Size; // WritePos is not strictly necessary for vector.insert but kept for consistency
+		return Size; // AngelScript examples return bytes written or 0 for success, docs say "Return the number of bytes written, or a negative value on error."
 	}
 };
 
 
-static asIScriptModule* Compile(asIScriptEngine* engine, const char* inputFile)
-{
-	builder.SetPragmaCallback(PragmaCallback, nullptr);
-	builder.SetIncludeCallback(IncludeCallback, nullptr);
-	asIScriptModule* module = engine->GetModule(get_exe().c_str(), asGM_ALWAYS_CREATE);
-	int result = builder.StartNewModule(engine, get_exe().c_str());
-	result = builder.AddSectionFromFile(inputFile);
-	if (defines.size() > 0) {
-		// Now, restart all, because we need to define all words before adding section
-		builder.ClearAll();
-		module = engine->GetModule(get_exe().c_str(), asGM_ALWAYS_CREATE);
-		result = builder.StartNewModule(engine, get_exe().c_str());
-		for (uint64_t i = 0; i < defines.size(); ++i) {
-			builder.DefineWord(defines[i].c_str());
-		}
-		result = builder.AddSectionFromFile(inputFile);
-
-	}
-	result = builder.BuildModule();
-
-	if (result < 0) {
-		show_message();
-		return nullptr;
-	}
-	CBytecodeStream stream;
-	if (module == 0)
-	{
-		engine->WriteMessage(inputFile, 0, 0, asMSGTYPE_ERROR, "Failed to retrieve the compiled bytecode");
-
-		show_message();
-
-		return nullptr;
-	}
-
-	result = module->SaveByteCode(&stream, true);
-	if (result < 0)
-	{
-		engine->WriteMessage(inputFile, 0, 0, asMSGTYPE_ERROR, "Failed to write the bytecode");
-
-		show_message();
-
-		return nullptr;
-	}
-	buffer = stream.GetCode();
-	buffer_size = stream.GetSize();
-	return module;
-}
-
-static int Load(asIScriptEngine* engine, std::vector<asBYTE> code)
-{
-	int r;
-	CBytecodeStream stream;
-	asIScriptModule* mod = engine->GetModule(get_exe().c_str());
-	if (mod == 0)
-	{
-		engine->WriteMessage("Product.ngt", 0, 0, asMSGTYPE_ERROR, "Failed to retrieve the compiled bytecode");
-
-		show_message();
-
-		return -1;
-	}
-	stream.Code = code;
-	r = mod->LoadByteCode(&stream);
-	if (r < 0)
-	{
-		engine->WriteMessage("Product.ngt", 0, 0, asMSGTYPE_ERROR, "Failed to read the bytecode");
-
-		show_message();
-
-		return -1;
-	}
-
-	return 0;
-}
-std::string g_Platform = "Auto";
-
-
-std::string StringToString(void* obj, int /* expandMembers */, CDebugger* /* dbg */)
-{
-	// We know the received object is a string
+// Debugger string conversion callbacks
+std::string StringToString(void* obj, int /* expandMembers */, CDebugger* /* dbg */) {
 	std::string* val = reinterpret_cast<std::string*>(obj);
-
-	// Format the output string
-	// TODO: Should convert non-readable characters to escape sequences
 	std::stringstream s;
 	s << "(len=" << val->length() << ") \"";
-	if (val->length() < 20)
-		s << *val << "\"";
-	else
-		s << val->substr(0, 20) << "...";
-
+	if (val->length() < 20) s << *val;
+	else s << val->substr(0, 17) << "...";
+	s << "\"";
 	return s.str();
 }
 
-// This is the to-string callback for the array type
-// This is generic and will take care of all template instances based on the array template
-std::string ArrayToString(void* obj, int expandMembers, CDebugger* dbg)
-{
+std::string ArrayToString(void* obj, int expandMembers, CDebugger* dbg) {
 	CScriptArray* arr = reinterpret_cast<CScriptArray*>(obj);
-
 	std::stringstream s;
 	s << "(len=" << arr->GetSize() << ")";
-
-	if (expandMembers > 0)
-	{
+	if (expandMembers > 0 && arr->GetSize() > 0) {
 		s << " [";
-		for (asUINT n = 0; n < arr->GetSize(); n++)
-		{
+		for (asUINT n = 0; n < arr->GetSize(); n++) {
 			s << dbg->ToString(arr->At(n), arr->GetElementTypeId(), expandMembers - 1, arr->GetArrayObjectType()->GetEngine());
-			if (n < arr->GetSize() - 1)
-				s << ", ";
+			if (n < arr->GetSize() - 1) s << ", ";
+			if (n >= 4 && arr->GetSize() > 5) { // Limit displayed elements for large arrays
+				s << ", ...";
+				break;
+			}
 		}
 		s << "]";
 	}
-
 	return s.str();
 }
 
-// This is the to-string callback for the dictionary type
-std::string DictionaryToString(void* obj, int expandMembers, CDebugger* dbg)
-{
+std::string DictionaryToString(void* obj, int expandMembers, CDebugger* dbg) {
 	CScriptDictionary* dic = reinterpret_cast<CScriptDictionary*>(obj);
-
 	std::stringstream s;
 	s << "(len=" << dic->GetSize() << ")";
-
-	if (expandMembers > 0)
-	{
-		s << " [";
+	if (expandMembers > 0 && dic->GetSize() > 0) {
+		s << " {";
 		asUINT n = 0;
-		for (CScriptDictionary::CIterator it = dic->begin(); it != dic->end(); it++, n++)
-		{
-			s << "[" << it.GetKey() << "] = ";
-
-			// Get the type and address of the value
+		for (CScriptDictionary::CIterator it = dic->begin(); it != dic->end(); it++, n++) {
+			s << "\"" << it.GetKey() << "\": ";
 			const void* val = it.GetAddressOfValue();
 			int typeId = it.GetTypeId();
-
-			// Use the engine from the currently active context (if none is active, the debugger
-			// will use the engine held inside it by default, but in an environment where there
-			// multiple engines this might not be the correct instance).
 			asIScriptContext* ctx = asGetActiveContext();
-
-			s << dbg->ToString(const_cast<void*>(val), typeId, expandMembers - 1, ctx ? ctx->GetEngine() : 0);
-
-			if (n < dic->GetSize() - 1)
-				s << ", ";
+			s << dbg->ToString(const_cast<void*>(val), typeId, expandMembers - 1, ctx->GetEngine());
+			if (n < dic->GetSize() - 1) s << ", ";
+			if (n >= 2 && dic->GetSize() > 3) { // Limit displayed elements
+				s << ", ...";
+				break;
+			}
 		}
-		s << "]";
+		s << "}";
 	}
-
 	return s.str();
 }
 
-// This is the to-string callback for the dictionary type
-std::string DateTimeToString(void* obj, int expandMembers, CDebugger* dbg)
-{
+std::string DateTimeToString(void* obj, int /*expandMembers*/, CDebugger* /*dbg*/) {
 	CDateTime* dt = reinterpret_cast<CDateTime*>(obj);
-
 	std::stringstream s;
-	s << "{" << dt->getYear() << "-" << dt->getMonth() << "-" << dt->getDay() << " ";
-	s << dt->getHour() << ":" << dt->getMinute() << ":" << dt->getSecond() << "}";
-
+	char buffer[30];
+	snprintf(buffer, sizeof(buffer), "%04d-%02d-%02d %02d:%02d:%02d",
+		dt->getYear(), dt->getMonth(), dt->getDay(),
+		dt->getHour(), dt->getMinute(), dt->getSecond());
+	s << buffer;
 	return s.str();
 }
 
 
+// Script execution command line arguments
+CScriptArray* g_commandLineArgs = nullptr;
+int           g_argc_script = 0;
+char** g_argv_script = nullptr;
 
-asIScriptContext* RequestContextCallback(asIScriptEngine* engine, void* param);
-void              ReturnContextCallback(asIScriptEngine* engine, asIScriptContext* ctx, void* param);
-
-
-void TranslateException(asIScriptContext* ctx, void* /*userParam*/) {
-	try {
-		throw;
+CScriptArray* GetCommandLineArgs() {
+	if (g_commandLineArgs) {
+		g_commandLineArgs->AddRef();
+		return g_commandLineArgs;
 	}
-	catch (Poco::Exception& e) {
+	asIScriptContext* ctx = asGetActiveContext();
+	if (!ctx) return nullptr; // Should not happen if called from script
+	asIScriptEngine* engine = ctx->GetEngine();
+
+	asITypeInfo* arrayType = engine->GetTypeInfoByDecl("array<string>");
+	if (!arrayType) return nullptr;
+
+	g_commandLineArgs = CScriptArray::Create(arrayType, (asUINT)0);
+	for (int n = 0; n < g_argc_script; ++n) {
+		g_commandLineArgs->Resize(g_commandLineArgs->GetSize() + 1);
+		((std::string*)g_commandLineArgs->At(n))->assign(g_argv_script[n]);
+	}
+	g_commandLineArgs->AddRef();
+	return g_commandLineArgs;
+}
+
+
+// System command execution
+int ExecSystemCmd(const std::string& cmd);
+int ExecSystemCmd(const std::string& str, std::string& out);
+
+
+void TranslateExceptionCallback(asIScriptContext* ctx, void* /*userParam*/) {
+	try {
+		throw; // Re-throw the C++ exception
+	}
+	catch (const Poco::Exception& e) {
 		ctx->SetException(e.displayText().c_str());
 	}
-	catch (std::exception& e) {
+	catch (const std::exception& e) {
 		ctx->SetException(e.what());
 	}
-	catch (...) {}
+	catch (...) {
+		ctx->SetException("Unknown C++ exception");
+	}
 }
+
+
+class NGTScripting;
+NGTScripting* g_app_scripting_instance = nullptr; // For access from global callbacks like RequestContextCallback
+
+asIScriptContext* RequestContextCallback(asIScriptEngine* engine, void* param);
+void ReturnContextCallback(asIScriptEngine* engine, asIScriptContext* ctx, void* param);
+
 
 class NGTScripting {
 public:
 	asIScriptEngine* scriptEngine = nullptr;
-	asIScriptContext* scriptContext = nullptr;
-	CContextMgr* m_ctxMgr = 0;
+	CContextMgr* m_ctxMgr = nullptr;
 	std::vector<asIScriptContext*> m_ctxPool;
-	CDebugger* m_dbg = 0;
+	CDebugger* m_debugger = nullptr;
+	bool SCRIPT_COMPILED_FLAG = false;
+
 	NGTScripting() {
-		scriptEngine = asCreateScriptEngine(ANGELSCRIPT_VERSION);
-		if (scriptEngine == nullptr) {
-			std::cout << "Failed to create the script engine." << std::endl;
+		g_app_scripting_instance = this;
+		scriptEngine = asCreateScriptEngine();
+		if (!scriptEngine) {
+			std::cerr << "Failed to create AngelScript engine." << std::endl;
+			throw std::runtime_error("Failed to create AngelScript engine.");
 		}
-		scriptEngine->SetMessageCallback(asFUNCTION(MessageCallback), 0, asCALL_CDECL);
-		scriptEngine->SetTranslateAppExceptionCallback(asFUNCTION(TranslateException), 0, asCALL_CDECL);
+		scriptEngine->SetMessageCallback(asFUNCTION(MessageCallback), nullptr, asCALL_CDECL);
+		scriptEngine->SetTranslateAppExceptionCallback(asFUNCTION(TranslateExceptionCallback), nullptr, asCALL_CDECL);
 		scriptEngine->SetEngineProperty(asEP_ALLOW_UNSAFE_REFERENCES, true);
 		scriptEngine->SetEngineProperty(asEP_INIT_GLOBAL_VARS_AFTER_BUILD, false);
 		scriptEngine->SetEngineProperty(asEP_ALLOW_IMPLICIT_HANDLE_TYPES, true);
-	}
-	~NGTScripting() {
-		if (m_dbg)
-		{
-			delete m_dbg;
-			m_dbg = 0;
-		}
 
+		// Context manager for co-routines. I don't know, but it is crashing the application
+		// m_ctxMgr = new CContextMgr();
+		// m_ctxMgr->RegisterCoRoutineSupport(scriptEngine);
+
+		scriptEngine->SetContextCallbacks(RequestContextCallback, ReturnContextCallback, this);
+	}
+
+	~NGTScripting() {
+		if (m_debugger) {
+			delete m_debugger;
+			m_debugger = nullptr;
+		}
+		for (auto* ctx : m_ctxPool) {
+			if (ctx) ctx->Release();
+		}
 		m_ctxPool.clear();
-		if (m_ctxMgr != 0) {
+
+		if (m_ctxMgr) {
 			delete m_ctxMgr;
 			m_ctxMgr = nullptr;
 		}
 
-		scriptEngine->ClearMessageCallback();
-		scriptEngine->GarbageCollect();
-		scriptEngine->ShutDownAndRelease();
-	}
-
-	std::stringstream printEnumList()
-	{
-		std::stringstream ss;
-		for (int i = 0; i < scriptEngine->GetEnumCount(); i++)
-		{
-			const auto e = scriptEngine->GetEnumByIndex(i);
-			if (not e) continue;
-			const std::string_view ns = e->GetNamespace();
-			if (not ns.empty()) ss << std::format("namespace {} {{\n", ns);
-			ss << std::format("enum {} {{\n", e->GetName());
-			for (int j = 0; j < e->GetEnumValueCount(); ++j)
-			{
-				ss << std::format("\t{}", e->GetEnumValueByIndex(j, nullptr));
-				if (j < e->GetEnumValueCount() - 1) ss << ",";
-				ss << "\n";
+		if (scriptEngine) {
+			if (g_commandLineArgs) {
+				g_commandLineArgs->Release();
+				g_commandLineArgs = nullptr;
 			}
-			ss << "}\n";
-			if (not ns.empty()) ss << "}\n";
+			scriptEngine->ShutDownAndRelease();
+			scriptEngine = nullptr;
 		}
-		return ss;
+		g_app_scripting_instance = nullptr;
 	}
 
-	std::stringstream printClassTypeList()
-	{
-		std::stringstream ss;
-		for (int i = 0; i < scriptEngine->GetObjectTypeCount(); i++)
-		{
-			const auto t = scriptEngine->GetObjectTypeByIndex(i);
-			if (not t) continue;
-
-			const std::string_view ns = t->GetNamespace();
-			if (not ns.empty()) ss << std::format("namespace {} {{\n", ns);
-
-			ss << std::format("class {}", t->GetName());
-			if (t->GetSubTypeCount() > 0)
-			{
-				ss << "<";
-				for (int sub = 0; sub < t->GetSubTypeCount(); ++sub)
-				{
-					if (sub < t->GetSubTypeCount() - 1) ss << ", ";
-					const auto st = t->GetSubType(sub);
-					ss << st->GetName();
-				}
-
-				ss << ">";
-			}
-
-			ss << "{\n";
-			for (int j = 0; j < t->GetBehaviourCount(); ++j)
-			{
-				asEBehaviours behaviours;
-				const auto f = t->GetBehaviourByIndex(j, &behaviours);
-				if (behaviours == asBEHAVE_CONSTRUCT
-					|| behaviours == asBEHAVE_DESTRUCT)
-				{
-					ss << std::format("\t{};\n", f->GetDeclaration(false, true, true));
-				}
-			}
-			for (int j = 0; j < t->GetMethodCount(); ++j)
-			{
-				const auto m = t->GetMethodByIndex(j);
-				ss << std::format("\t{};\n", m->GetDeclaration(false, true, true));
-			}
-			for (int j = 0; j < t->GetPropertyCount(); ++j)
-			{
-				ss << std::format("\t{};\n", t->GetPropertyDeclaration(j, true));
-			}
-			for (int j = 0; j < t->GetChildFuncdefCount(); ++j)
-			{
-				ss << std::format("\tfuncdef {};\n", t->GetChildFuncdef(j)->GetFuncdefSignature()->GetDeclaration(false));
-			}
-			ss << "}\n";
-			if (not ns.empty()) ss << "}\n";
-		}
-		return ss;
-	}
-
-	std::stringstream printGlobalFunctionList()
-	{
-		std::stringstream ss;
-		for (int i = 0; i < scriptEngine->GetGlobalFunctionCount(); i++)
-		{
-			const auto f = scriptEngine->GetGlobalFunctionByIndex(i);
-			if (not f) continue;
-			const std::string_view ns = f->GetNamespace();
-			if (not ns.empty()) ss << std::format("namespace {} {{ ", ns);
-			ss << std::format("{};", f->GetDeclaration(false, false, true));
-			if (not ns.empty()) ss << " }";
-			ss << "\n";
-		}
-		return ss;
-	}
-
-	std::stringstream printGlobalPropertyList()
-	{
-		std::stringstream ss;
-
-		for (int i = 0; i < scriptEngine->GetGlobalPropertyCount(); i++)
-		{
-			const char* name;
-			const char* ns0;
-			int type;
-			scriptEngine->GetGlobalPropertyByIndex(i, &name, &ns0, &type, nullptr, nullptr, nullptr, nullptr);
-
-			const std::string t = scriptEngine->GetTypeDeclaration(type, true);
-			if (t.empty()) continue;
-
-			std::string_view ns = ns0;
-			if (not ns.empty()) ss << std::format("namespace {} {{ ", ns);
-
-			ss << std::format("{} {};", t, name);
-			if (not ns.empty()) ss << " }";
-			ss << "\n";
-		}
-		return ss;
-	}
-
-	std::stringstream printGlobalTypedef()
-	{
-		std::stringstream ss;
-
-		for (int i = 0; i < scriptEngine->GetTypedefCount(); ++i)
-		{
-			const auto type = scriptEngine->GetTypedefByIndex(i);
-			if (not type) continue;
-			const std::string_view ns = type->GetNamespace();
-			if (not ns.empty()) ss << std::format("namespace {} {{\n", ns);
-			ss << std::format(
-				"typedef {} {};\n", scriptEngine->GetTypeDeclaration(type->GetTypedefTypeId()), type->GetName());
-			if (not ns.empty()) ss << "}\n";
-		}
-		return ss;
-	}
-
-	int WriteInfo()
-	{
-		std::ofstream f("as.predefined");
-		if (!f.is_open())return -1;
-		f << printEnumList().str();
-
-		f << printClassTypeList().str();
-
-		f << printGlobalFunctionList().str();
-
-		f << printGlobalPropertyList().str();
-
-		f << printGlobalTypedef().str();
-		f.close();
-		return 0;
-	}
-
-
-	void InitializeDebugger()
-	{
-		// Create the debugger instance and store it so the context callback can attach
-		// it to the scripts contexts that will be used to execute the scripts
-		m_dbg = new CDebugger();
-
-		// Let the debugger hold an engine pointer that can be used by the callbacks
-		m_dbg->SetEngine(scriptEngine);
-
-		// Register the to-string callbacks so the user can see the contents of strings
-		m_dbg->RegisterToStringCallback(scriptEngine->GetTypeInfoByName("string"), StringToString);
-		m_dbg->RegisterToStringCallback(scriptEngine->GetTypeInfoByName("array"), ArrayToString);
-		m_dbg->RegisterToStringCallback(scriptEngine->GetTypeInfoByName("dictionary"), DictionaryToString);
-		m_dbg->RegisterToStringCallback(scriptEngine->GetTypeInfoByName("datetime"), DateTimeToString);
-
-		// Allow the user to initialize the debugging before moving on
-		cout << "Debugging, waiting for commands. Type 'h' for help." << endl;
-		m_dbg->TakeCommands(scriptContext);
-	}
-
-
-	void RegisterStd() {
+	void RegisterStandardAPI() {
 		RegisterStdString(scriptEngine);
 		RegisterStdWstring(scriptEngine);
 		RegisterScriptArray(scriptEngine, true);
@@ -795,581 +544,659 @@ public:
 		RegisterScriptMathComplex(scriptEngine);
 		RegisterScriptHandle(scriptEngine);
 		RegisterScriptAny(scriptEngine);
+
 		RegisterFunctions(scriptEngine);
+
 		scriptEngine->RegisterGlobalFunction("array<string> @get_char_argv()", asFUNCTION(GetCommandLineArgs), asCALL_CDECL);
-		scriptEngine->RegisterGlobalFunction("int exec(const string &in)", asFUNCTIONPR(ExecSystemCmd, (const string&), int), asCALL_CDECL);
-		scriptEngine->RegisterGlobalFunction("int exec(const string &in, string &out)", asFUNCTIONPR(ExecSystemCmd, (const string&, string&), int), asCALL_CDECL);
-		scriptEngine->RegisterGlobalProperty("const bool SCRIPT_COMPILED", (void*)&SCRIPT_COMPILED);
-		scriptEngine->RegisterGlobalFunction("string get_SCRIPT_EXECUTABLE()property", asFUNCTION(get_exe), asCALL_CDECL);
-		scriptEngine->RegisterGlobalFunction("string get_SCRIPT_EXECUTABLE_PATH()property", asFUNCTION(get_exe_path), asCALL_CDECL);
+		scriptEngine->RegisterGlobalFunction("int exec(const string &in)", asFUNCTIONPR(ExecSystemCmd, (const std::string&), int), asCALL_CDECL);
+		scriptEngine->RegisterGlobalFunction("int exec(const string &in, string &out)", asFUNCTIONPR(ExecSystemCmd, (const std::string&, std::string&), int), asCALL_CDECL);
+		scriptEngine->RegisterGlobalProperty("const bool SCRIPT_COMPILED", (void*)&SCRIPT_COMPILED_FLAG);
+		scriptEngine->RegisterGlobalFunction("string get_SCRIPT_EXECUTABLE() property", asFUNCTION(get_exe_helper), asCALL_CDECL);
+		scriptEngine->RegisterGlobalFunction("string get_SCRIPT_EXECUTABLE_PATH() property", asFUNCTION(get_exe_path_helper), asCALL_CDECL);
 		scriptEngine->RegisterGlobalFunction("void assert(bool expr, const string&in fail_text = \"\")", asFUNCTION(ScriptAssert), asCALL_CDECL);
-
-		//		m_ctxMgr = new CContextMgr();
-		//		m_ctxMgr->RegisterCoRoutineSupport(scriptEngine);
-
-				// Tell the engine to use our context pool. This will also 
-				// allow us to debug internal script calls made by the engine
-		scriptEngine->SetContextCallbacks(RequestContextCallback, ReturnContextCallback, this);
 	}
-	int Exec(asIScriptFunction* func) {
-		if (func == nullptr)return -1;
-		asIScriptModule* mod = func->GetModule();
-		if (!mod)return -1;
 
-		int r = 0;
-		r = mod->ResetGlobalVars(0);
-		if (r < 0)
-		{
-			scriptEngine->WriteMessage(mod->GetName(), 0, 0, asMSGTYPE_ERROR, "Failed while initializing global variables");
+	// Compiles script from file, returns module and bytecode
+	asIScriptModule* CompileScriptToBytecode(const char* scriptFile, std::vector<asBYTE>& outBytecode, const std::string& moduleName) {
+		CScriptBuilder builder;
+		builder.SetPragmaCallback(PragmaCallback, nullptr); // Pragma callback uses the builder passed to it
+		builder.SetIncludeCallback(IncludeCallback, nullptr);
+
+		int r = builder.StartNewModule(scriptEngine, moduleName.c_str());
+		if (r < 0) {
+			show_message();
+			return nullptr;
+		}
+		r = builder.AddSectionFromFile(scriptFile);
+		if (r < 0) {
+			show_message();
+			return nullptr;
+		}
+		r = builder.BuildModule();
+		if (r < 0) {
+			show_message();
+			return nullptr;
+		}
+
+		asIScriptModule* module = scriptEngine->GetModule(moduleName.c_str());
+		CBytecodeStream stream;
+		if (module && module->SaveByteCode(&stream, true) >= 0) {
+			outBytecode = stream.Code;
+			return module;
+		}
+		scriptEngine->WriteMessage(scriptFile, 0, 0, asMSGTYPE_ERROR, "Failed to save bytecode from compiled module.");
+		show_message();
+		return nullptr;
+	}
+
+	// Loads bytecode into a new module
+	asIScriptModule* LoadBytecodeIntoModule(const std::vector<asBYTE>& bytecode, const std::string& moduleName) {
+		asIScriptModule* module = scriptEngine->GetModule(moduleName.c_str(), asGM_ALWAYS_CREATE);
+		if (!module) {
+			scriptEngine->WriteMessage("BytecodeLoad", 0, 0, asMSGTYPE_ERROR, "Failed to create module for bytecode loading.");
+			show_message();
+			return nullptr;
+		}
+
+		CBytecodeStream stream(bytecode);
+		if (module->LoadByteCode(&stream) < 0) {
+			scriptEngine->WriteMessage("BytecodeLoad", 0, 0, asMSGTYPE_ERROR, "Failed to load bytecode into module.");
+			show_message();
+			scriptEngine->DiscardModule(moduleName.c_str());
+			return nullptr;
+		}
+		return module;
+	}
+
+	int ExecuteMain(asIScriptModule* module) {
+		if (!module) return -1;
+
+		asIScriptFunction* func = module->GetFunctionByName("main");
+		if (!func) {
+			std::cerr << "Entry point 'main()' not found in module '" << module->GetName() << "'." << std::endl;
+			return -1;
+		}
+
+		// It's good practice to re-initialize global vars if module might be reused,
+		if (module->ResetGlobalVars(nullptr) < 0) { // Pass nullptr for default context
+			scriptEngine->WriteMessage(module->GetName(), 0, 0, asMSGTYPE_ERROR, "Failed to reset global variables.");
+			show_message();
+			return -1;
+		}
+
+		asIScriptContext* ctx = scriptEngine->RequestContext();
+		if (!ctx) {
+			std::cerr << "Failed to request script context." << std::endl;
+			return -1;
+		}
+		ctx->Prepare(func);
+
+		if (m_debugger) {
+			std::cout << "Debugger active. Type 'c' to continue, 'h' for help." << std::endl;
+			m_debugger->TakeCommands(ctx);
+		}
+
+		int r = ctx->Execute();
+		int retVal = 0;
+
+		if (r == asEXECUTION_FINISHED) {
+			if (func->GetReturnTypeId() == asTYPEID_VOID) {
+				retVal = 0;
+			}
+			else if (func->GetReturnTypeId() == asTYPEID_INT32) {
+				retVal = ctx->GetReturnDWord();
+			}
+			else {
+				retVal = 0;
+			}
+		}
+		else if (r == asEXECUTION_EXCEPTION) {
+			alert("NGTRuntimeError", GetExceptionInfo(ctx, true));
+			retVal = -1;
+		}
+		else if (r == asEXECUTION_ABORTED) {
+			retVal = g_retcode;
+		}
+		else {
+			std::cerr << "Script execution failed with code: " << r << std::endl;
+			retVal = -1; // Other error
+		}
+
+		scriptEngine->ReturnContext(ctx);
+		return retVal;
+	}
+
+	void InitializeDebugger() {
+		if (!m_debugger) {
+			m_debugger = new CDebugger();
+			m_debugger->SetEngine(scriptEngine);
+			// Register to-string callbacks
+			asITypeInfo* stringType = scriptEngine->GetTypeInfoByName("string");
+			if (stringType) m_debugger->RegisterToStringCallback(stringType, StringToString);
+
+			asITypeInfo* arrayType = scriptEngine->GetTypeInfoByDecl("array<T>"); // Get template
+			if (arrayType) m_debugger->RegisterToStringCallback(arrayType, ArrayToString);
+
+			asITypeInfo* dictType = scriptEngine->GetTypeInfoByName("dictionary");
+			if (dictType) m_debugger->RegisterToStringCallback(dictType, DictionaryToString);
+
+			asITypeInfo* dtType = scriptEngine->GetTypeInfoByName("datetime");
+			if (dtType) m_debugger->RegisterToStringCallback(dtType, DateTimeToString);
+		}
+	}
+
+	void DeinitializeDebugger() {
+		if (m_debugger) {
+			delete m_debugger;
+			m_debugger = nullptr;
+			// Contexts need their line callback cleared if debugger is removed mid-session
+		}
+	}
+
+	int WritePredefinedAPIFile(const std::string& outputPath) {
+		std::ofstream f(outputPath);
+		if (!f.is_open()) {
+			std::cerr << "Failed to open " << outputPath << " for writing." << std::endl;
+			return -1;
+		}
+		f << "// AngelScript Predefined API Dump for NGT\n\n";
+		f << "// Enums\n";
+		for (asUINT i = 0; i < scriptEngine->GetEnumCount(); ++i) {
+			asITypeInfo* enumType = scriptEngine->GetEnumByIndex(i);
+			if (enumType) f << "enum " << enumType->GetName() << " { /* ... values ... */ };\n";
+		}
+		f << "\n// Object Types (Classes, Interfaces)\n";
+		for (asUINT i = 0; i < scriptEngine->GetObjectTypeCount(); ++i) {
+			asITypeInfo* objType = scriptEngine->GetObjectTypeByIndex(i);
+			if (objType) f << "class " << objType->GetName() << " { /* ... members ... */ };\n";
+		}
+		f << "\n// Global Functions\n";
+		for (asUINT i = 0; i < scriptEngine->GetGlobalFunctionCount(); ++i) {
+			asIScriptFunction* func = scriptEngine->GetGlobalFunctionByIndex(i);
+			if (func) f << func->GetDeclaration(true, true, true) << ";\n";
+		}
+		f << "\n// Global Properties\n";
+		for (asUINT i = 0; i < scriptEngine->GetGlobalPropertyCount(); ++i) {
+			const char* name, * nameSpace;
+			int typeId;
+			bool isConst;
+			scriptEngine->GetGlobalPropertyByIndex(i, &name, &nameSpace, &typeId, &isConst);
+			f << (isConst ? "const " : "") << scriptEngine->GetTypeDeclaration(typeId, true) << " " << name << ";\n";
+		}
+		f.close();
+		std::cout << "API definition written to " << outputPath << std::endl;
+		return 0;
+	}
+};
+
+// Context Callbacks
+asIScriptContext* RequestContextCallback(asIScriptEngine* /*engine*/, void* param) {
+	NGTScripting* scripting = static_cast<NGTScripting*>(param);
+	asIScriptContext* ctx = nullptr;
+	if (!scripting->m_ctxPool.empty()) {
+		ctx = scripting->m_ctxPool.back();
+		scripting->m_ctxPool.pop_back();
+	}
+	else {
+		ctx = scripting->scriptEngine->CreateContext();
+		if (!ctx) {
+			std::cerr << "Failed to create new script context in callback." << std::endl;
+			return nullptr;
+		}
+	}
+	if (scripting->m_debugger && ctx) {
+		ctx->SetLineCallback(asMETHOD(CDebugger, LineCallback), scripting->m_debugger, asCALL_THISCALL);
+	}
+	return ctx;
+}
+
+void ReturnContextCallback(asIScriptEngine* /*engine*/, asIScriptContext* ctx, void* param) {
+	NGTScripting* scripting = static_cast<NGTScripting*>(param);
+	ctx->Unprepare(); // Important!
+	if (scripting->m_debugger) {
+		ctx->ClearLineCallback();
+	}
+	scripting->m_ctxPool.push_back(ctx);
+}
+
+
+// Main Application Class
+class NGTEntry : public Application {
+private:
+	NGTScripting m_scripting;
+	std::string m_scriptFileToProcess;
+	std::string m_outputFile; // For compilation target
+
+	enum class OperationMode {
+		NONE, HELP, DEBUG_SCRIPT, RUN_SCRIPT,
+		COMPILE_SCRIPT, DUMP_PREDEFINED, EXECUTE_EMBEDDED
+	};
+	OperationMode m_opMode = OperationMode::NONE;
+	bool m_helpRequested = false;
+
+
+public:
+	int m_lastReturnCode = 0;
+
+	NGTEntry() {
+		setUnixOptions(true);
+	}
+
+protected:
+	void initialize(Application& self) override {
+#ifdef _WIN32
+		timeBeginPeriod(1);
+#endif
+		Application::initialize(self);
+
+		m_scripting.RegisterStandardAPI();
+
+
+		// Check if this executable has embedded bytecode
+		std::vector<asBYTE> bytecode;
+		if (loadBytecodeFromExecutableInternal(bytecode) && !bytecode.empty()) {
+			m_opMode = OperationMode::EXECUTE_EMBEDDED;
+			m_scripting.SCRIPT_COMPILED_FLAG = true;
+			stopOptionsProcessing(); // Don't process command line options if bytecode is embedded
+		}
+	}
+
+	void uninitialize() override {
+#ifdef _WIN32
+		timeEndPeriod(1);
+#endif
+		soundsystem_free();
+		Application::uninitialize();
+	}
+
+	void defineOptions(OptionSet& options) override {
+		Application::defineOptions(options);
+		options.addOption(
+			Option("help", "h", "Display help information")
+			.required(false).repeatable(false).callback(OptionCallback<NGTEntry>(this, &NGTEntry::handleHelp)));
+		options.addOption(
+			Option("debug", "d", "Debug a script file.")
+			.required(false).argument("script.as").repeatable(false).callback(OptionCallback<NGTEntry>(this, &NGTEntry::handleDebug)));
+		options.addOption(
+			Option("run", "r", "Run a script file.")
+			.required(false).argument("script.as").repeatable(false).callback(OptionCallback<NGTEntry>(this, &NGTEntry::handleRun)));
+		options.addOption(
+			Option("compile", "c", "Compile a script to an executable.")
+			.required(false).argument("script.as", true).repeatable(false).callback(OptionCallback<NGTEntry>(this, &NGTEntry::handleCompile)));
+		options.addOption(
+			Option("dumpapi", "p", "Generate as.predefined API file for IDEs.")
+			.required(false).repeatable(false).callback(OptionCallback<NGTEntry>(this, &NGTEntry::handleDumpApi)));
+	}
+
+	// Option Handlers
+	void handleHelp(const std::string& name, const std::string& value) {
+		m_helpRequested = true;
+		m_opMode = OperationMode::HELP;
+		stopOptionsProcessing();
+	}
+	void handleDebug(const std::string& name, const std::string& value) {
+		m_opMode = OperationMode::DEBUG_SCRIPT;
+		m_scriptFileToProcess = value;
+		stopOptionsProcessing();
+	}
+	void handleRun(const std::string& name, const std::string& value) {
+		m_opMode = OperationMode::RUN_SCRIPT;
+		m_scriptFileToProcess = value;
+		stopOptionsProcessing();
+	}
+	void handleCompile(const std::string& name, const std::string& value) {
+		m_opMode = OperationMode::COMPILE_SCRIPT;
+		m_scriptFileToProcess = value;
+		m_outputFile = "out.exe";
+		stopOptionsProcessing();
+	}
+	void handleDumpApi(const std::string& name, const std::string& value) {
+		m_opMode = OperationMode::DUMP_PREDEFINED;
+		stopOptionsProcessing();
+	}
+
+
+	int main(const ArgVec& args) override {
+		g_argc_script = args.size() - 1;
+		std::vector<char*> c_style_args;
+		for (size_t i = 1; i < argv().size(); ++i) { // Skip argv()[0]
+			c_style_args.push_back(const_cast<char*>(argv()[i].c_str()));
+		}
+		g_argv_script = c_style_args.data(); // Pointer to data in vector, ensure vector outlives usage
+
+		switch (m_opMode) {
+		case OperationMode::HELP:
+			displayHelp();
+			m_lastReturnCode = Application::EXIT_OK;
+			break;
+		case OperationMode::EXECUTE_EMBEDDED:
+			m_lastReturnCode = doExecuteEmbeddedBytecode();
+			break;
+		case OperationMode::RUN_SCRIPT:
+			m_lastReturnCode = doRunScript();
+			break;
+		case OperationMode::DEBUG_SCRIPT:
+			m_lastReturnCode = doDebugScript();
+			break;
+		case OperationMode::COMPILE_SCRIPT:
+			m_lastReturnCode = doCompileScript();
+			break;
+		case OperationMode::DUMP_PREDEFINED:
+			m_lastReturnCode = doDumpApi();
+			break;
+		case OperationMode::NONE:
+			if (!m_helpRequested) {
+				displayHelp();
+				m_lastReturnCode = Application::EXIT_USAGE;
+			}
+			else {
+				m_lastReturnCode = Application::EXIT_OK;
+			}
+			break;
+		}
+		return m_lastReturnCode;
+	}
+
+	void displayHelp() {
+		HelpFormatter helpFormatter(options());
+		helpFormatter.setCommand(commandName());
+		helpFormatter.setUsage("OPTIONS");
+		helpFormatter.setHeader("NGT (New Game Toolkit) - AngelScript Runtime and Compiler");
+		helpFormatter.format(std::cout);
+	}
+
+	// Action methods
+	int doExecuteEmbeddedBytecode() {
+		std::vector<asBYTE> bytecode;
+		if (!loadBytecodeFromExecutableInternal(bytecode) || bytecode.empty()) {
+			std::cerr << "Failed to load embedded bytecode or bytecode is empty." << std::endl;
+			return -1;
+		}
+
+		// Decrypt and de-obfuscate
+		std::string key_material = string_base64_encode(NGT_BYTECODE_ENCRYPTION_KEY);
+		std::vector<asBYTE> decrypted_bytecode = aes_decrypt_vector(bytecode, key_material);
+		if (decrypted_bytecode.empty() && !bytecode.empty()) { // Decryption failed if result is empty but input was not
+			std::cerr << "AES decryption of embedded bytecode failed." << std::endl;
+			return -1;
+		}
+		apply_simple_obfuscation(decrypted_bytecode); // Reverse simple obfuscation
+
+		std::string module_name = Poco::Path(get_exe_helper()).getBaseName();
+		asIScriptModule* module = m_scripting.LoadBytecodeIntoModule(decrypted_bytecode, module_name);
+		if (!module) return -1;
+
+		int result = m_scripting.ExecuteMain(module);
+		m_scripting.scriptEngine->DiscardModule(module_name.c_str());
+		return result;
+	}
+
+	int doRunOrDebugScript(bool debug) {
+		if (debug) {
+#ifdef _WIN32
+			if (GetConsoleWindow() == nullptr) { // Check if running in a console
+				alert("NGT Error", "Debugger must be run from a command console.");
+				return -2;
+			}
+#endif
+			m_scripting.InitializeDebugger();
+			std::cout << "NGT Debugger Initialized. Script: " << m_scriptFileToProcess << std::endl;
+		}
+
+		std::vector<asBYTE> bytecode;
+		std::string module_name = Poco::Path(m_scriptFileToProcess).getBaseName();
+		asIScriptModule* module = m_scripting.CompileScriptToBytecode(m_scriptFileToProcess.c_str(), bytecode, module_name);
+
+		if (!module) return -1;
+
+		int result = m_scripting.ExecuteMain(module);
+
+		m_scripting.scriptEngine->DiscardModule(module_name.c_str());
+		if (debug) m_scripting.DeinitializeDebugger();
+		return result;
+	}
+
+	int doRunScript() { return doRunOrDebugScript(false); }
+	int doDebugScript() { return doRunOrDebugScript(true); }
+
+	int doCompileScript() {
+		std::vector<asBYTE> bytecode_raw;
+		std::string module_name = Poco::Path(m_scriptFileToProcess).getBaseName();
+		asIScriptModule* module = m_scripting.CompileScriptToBytecode(m_scriptFileToProcess.c_str(), bytecode_raw, module_name);
+
+		if (!module) {
+			if (bytecode_raw.empty()) {
+				std::cerr << "Compilation failed or produced no bytecode." << std::endl;
+				return -1;
+			}
+		}
+		if (bytecode_raw.empty()) {
+			std::cerr << "Compilation produced no bytecode despite module success." << std::endl;
+			if (module) m_scripting.scriptEngine->DiscardModule(module_name.c_str());
 			return -1;
 		}
 
 
-		scriptContext = scriptEngine->RequestContext();
-		scriptContext->Prepare(func);
-		// Execute the script until completion
-		r = scriptContext->Execute();
-		if (scriptContext == nullptr)return r;
-		r = scriptContext->GetState();
-		if (r != asEXECUTION_FINISHED)
-		{
-			if (r == asEXECUTION_EXCEPTION)
-			{
-				alert("NGTRuntimeError", GetExceptionInfo(scriptContext, true));
-				r = -1;
-			}
-			else if (r == asEXECUTION_ABORTED)
-			{
-				r = g_retcode;
-			}
-			else
-			{
-				r = -1;
-			}
+		apply_simple_obfuscation(bytecode_raw);
+		std::string key_material = string_base64_encode(NGT_BYTECODE_ENCRYPTION_KEY);
+		std::vector<asBYTE> bytecode_processed = aes_encrypt_vector(bytecode_raw, key_material);
+
+		if (bytecode_processed.empty() && !bytecode_raw.empty()) {
+			std::cerr << "AES encryption failed." << std::endl;
+			if (module) m_scripting.scriptEngine->DiscardModule(module_name.c_str());
+			return -1;
 		}
-		else
-		{
-			// Get the return value from the script
-			if (func->GetReturnTypeId() == asTYPEID_INT32)
-			{
-				r = *(int*)scriptContext->GetAddressOfReturnValue();
-			}
-			else
-				r = 0;
+
+
+		if (!saveBytecodeToExecutableInternal(m_outputFile, bytecode_processed)) {
+			std::cerr << "Failed to save bytecode to executable: " << m_outputFile << std::endl;
+			if (module) m_scripting.scriptEngine->DiscardModule(module_name.c_str());
+			return -1;
 		}
-		scriptEngine->ReturnContext(scriptContext);
-		return r;
-	};
-};
 
-asIScriptContext* RequestContextCallback(asIScriptEngine* engine, void* param)
-{
-	NGTScripting* instance = (NGTScripting*)param;
-	asIScriptContext* ctx = 0;
-
-	// Check if there is a free context available in the pool
-	if (instance->m_ctxPool.size())
-	{
-		ctx = instance->m_ctxPool.back();
-		instance->m_ctxPool.pop_back();
-	}
-	else
-	{
-		// No free context was available so we'll have to create a new one
-		ctx = engine->CreateContext();
+		std::cout << "Script '" << m_scriptFileToProcess << "' compiled to '" << m_outputFile << "' successfully." << std::endl;
+		if (module) m_scripting.scriptEngine->DiscardModule(module_name.c_str()); // Discard module after getting bytecode
+		return 0;
 	}
 
-	// Attach the debugger if needed
-	if (ctx && instance->m_dbg)
-	{
-		// Set the line callback for the debugging
-		ctx->SetLineCallback(asMETHOD(CDebugger, LineCallback), instance->m_dbg, asCALL_THISCALL);
+	int doDumpApi() {
+		return m_scripting.WritePredefinedAPIFile("as.predefined");
 	}
 
-	return ctx;
-}
-
-// This function is called by the engine when the context is no longer in use
-void ReturnContextCallback(asIScriptEngine* engine, asIScriptContext* ctx, void* param)
-{
-	NGTScripting* instance = (NGTScripting*)param;
-	// We can also check for possible script exceptions here if so desired
-
-	// Unprepare the context to free any objects it may still hold (e.g. return value)
-	// This must be done before making the context available for re-use, as the clean
-	// up may trigger other script executions, e.g. if a destructor needs to call a function.
-	ctx->Unprepare();
-
-	// Place the context into the pool for when it will be needed again
-	instance->m_ctxPool.push_back(ctx);
-}
-
-
-
-
-
-
-
-std::string filename;
-std::string flag;
-int scriptArg = 0;
-std::string this_exe;
-NGTScripting* app = nullptr;
-CContextMgr* get_context_manager() {
-	return app->m_ctxMgr;
-}
-NGTScripting* get_scripting_instance() {
-	if (app)
-		return app;
-	return nullptr;
-}
-class NGTEntry : public Application {
 private:
-	bool _helpRequested;
-	bool bytecodeExecute;
-	asIScriptModule* module;
-public:
-	int m_retcode;
-	NGTEntry() : _helpRequested(false), bytecodeExecute(false)
-	{
-		setUnixOptions(true);
-		app = new NGTScripting;
-		app->RegisterStd();
-	}
-	~NGTEntry() {
-		if (app) {
-			delete app;
-			app = nullptr;
-		}
-		soundsystem_free();
-	}
+	bool loadBytecodeFromExecutableInternal(std::vector<asBYTE>& outBytecode) {
+		outBytecode.clear();
+		std::string exePath = get_exe_helper();
 
-protected:
-	void initialize(Application& self)override
-	{
 #ifdef _WIN32
-		timeBeginPeriod(1);
-#endif
+		HMODULE hModule = GetModuleHandle(nullptr);
+		if (!hModule) return false;
+		HRSRC hRes = FindResource(hModule, NGT_BYTECODE_RESOURCE_ID_W, NGT_BYTECODE_RESOURCE_TYPE_W);
+		if (!hRes) return false;
+		HGLOBAL hResLoad = LoadResource(hModule, hRes);
+		if (!hResLoad) return false;
+		LPVOID lpResLock = LockResource(hResLoad);
+		if (!lpResLock) {
+			FreeResource(hResLoad); return false;
+			DWORD dwSize = SizeofResource(hModule, hRes);
+			if (dwSize == 0) { UnlockResource(hResLoad); FreeResource(hResLoad); return false; } //Don't call FreeResource on success with LockResource
 
-		Application::initialize(self);
-		this_exe = get_exe();
-		std::fstream read_file(this_exe.c_str(), std::ios::binary | std::ios::in);
-		read_file.seekg(0, std::ios::end);
-		long file_size = read_file.tellg();
-
-		read_file.seekg(file_size - sizeof(asUINT));
-
-		read_file.read(reinterpret_cast<char*>(&buffer_size), sizeof(asUINT));
-		if (buffer_size != 0) {
-			bytecodeExecute = true;
-			stopOptionsProcessing();
-
+			outBytecode.assign(static_cast<asBYTE*>(lpResLock), static_cast<asBYTE*>(lpResLock) + dwSize);
+			return true;
 		}
-
-	}
-
-	void uninitialize()override
-	{
-		Application::uninitialize();
-#ifdef _WIN32
-		timeEndPeriod(1);
-#endif
-
-	}
-
-	void reinitialize(Application& self)
-	{
-		Application::reinitialize(self);
-	}
-	void defineOptions(OptionSet& options)override
-	{
-		if (bytecodeExecute) {
-			return;
-		}
-		Application::defineOptions(options);
-		options.addOption(
-			Option("Help", "h", "Display help information on command line arguments")
-			.required(false)
-			.repeatable(false)
-		);
-		options.addOption(
-			Option("Debug", "d", "Debug a script")
-			.required(false)
-			.argument("Script path to execute")
-		);
-		options.addOption(
-			Option("Run", "r", "Run a script")
-			.required(false)
-			.argument("Script path to execute")
-		);
-		options.addOption(
-			Option("Compile", "c", "Compile a script to an executable file")
-			.required(false)
-			.argument("Script path to compile")
-		);
-		options.addOption(
-			Option("DumpPredefined", "p", "Generate as.predefined file for VSCode extension")
-			.required(false)
-			.repeatable(false)
-		);
-
-	}
-	void handleOption(const std::string& name, const std::string& value)override
-	{
-		if (bytecodeExecute) {
-			return;
-		}
-		if (name == "Help") {
-			_helpRequested = true;
-			displayHelp();
-		}
-		else if (name == "Debug") {
-			debugScript(name, value);
-		}
-		else if (name == "Run") {
-			runScript(name, value);
-		}
-		else if (name == "Compile") {
-			compileScript(name, value);
-		}
-		else if (name == "DumpPredefined") {
-			std::cout << app->WriteInfo() << endl;
-		}
-		stopOptionsProcessing();
-
-	}
-	void displayHelp()
-	{
-		HelpFormatter helpFormatter(options());
-		helpFormatter.setUnixStyle(true);
-		helpFormatter.setIndent(4);
-
-		helpFormatter.setCommand(commandName());
-		helpFormatter.setUsage("OPTIONS");
-		helpFormatter.setHeader("NGT (New Game Toolkit)");
-		helpFormatter.format(std::cout);
-#ifdef _WIN32
-		if (GetConsoleWindow() == 0) {
-			std::stringstream ss;
-			helpFormatter.format(ss);
-			std::string str = ss.str();
-			app->scriptEngine->WriteMessage(get_exe().c_str(), 0, 0, asMSGTYPE_INFORMATION, str.c_str());
-			show_message(true, false, false);
-		}
-#endif
-	}
-
-	void debugScript(const std::string& name, const std::string& value) {
-#ifdef _WIN32
-		if (GetConsoleWindow() == 0) {
-			app->scriptEngine->WriteMessage(get_exe().c_str(), 0, 0, asMSGTYPE_ERROR, "Please use the command line version of NGT to invoke the debugger");
-			show_message();
-			m_retcode = -2;
-			return;
-		}
-#endif
-		// Compile the script
-		module = Compile(app->scriptEngine, value.c_str());
-		if (module == nullptr) {
-			m_retcode = -1;
-			return;
-		}
-		// Execute the script
-		asIScriptFunction* func = module->GetFunctionByName("main");
-		if (func == 0) {
-			std::cout << "Failed to invoke main." << std::endl;
-			m_retcode = 1;
-			return;
-		}
-		app->InitializeDebugger();
-		int result = app->Exec(func);
-		m_retcode = result;
-		module->Discard();
-	}
-
-	void runScript(const std::string& name, const std::string& value) {
-		// Compile the script
-
-		module = Compile(app->scriptEngine, value.c_str());
-		if (module == nullptr) {
-			m_retcode = -1;
-			return;
-		}
-		// Execute the script
-		asIScriptFunction* func = module->GetFunctionByName("main");
-		if (func == 0) {
-			std::cout << "Failed to invoke main." << std::endl;
-			m_retcode = 1;
-			return;
-		}
-		int result = app->Exec(func);
-
-		m_retcode = result;
-		module->Discard();
-
-	}
-	void compileScript(const std::string& name, const std::string& value) {
-		// Compile the script
-		module = Compile(app->scriptEngine, value.c_str());
-		if (module == nullptr) {
-			m_retcode = -1;
-			return;
-		}
-		// Call compiler to create executable file
-		std::string main_exe = get_exe();
-		std::vector<std::string> name_split = string_split(".", value);
-		std::string bundle = name_split[0];
-		if (g_Platform == "Auto") {
-#ifdef _WIN32
-			g_Platform = "Windows";
+		return false;
 #else
-			g_Platform = "Linux";
+		std::ifstream file(exePath, std::ios::binary | std::ios::ate);
+		if (!file.is_open()) return false;
+		std::streamsize fileSize = file.tellg();
+		if (fileSize < static_cast<std::streamsize>(NGT_BYTECODE_FILE_SIGNATURE_LEN + sizeof(asUINT))) return false;
+
+		std::vector<char> signature_check(NGT_BYTECODE_FILE_SIGNATURE_LEN);
+		file.seekg(fileSize - static_cast<std::streamsize>(NGT_BYTECODE_FILE_SIGNATURE_LEN));
+		file.read(signature_check.data(), NGT_BYTECODE_FILE_SIGNATURE_LEN);
+		if (std::string(signature_check.data(), NGT_BYTECODE_FILE_SIGNATURE_LEN) != NGT_BYTECODE_FILE_SIGNATURE) {
+			return false;
+		}
+
+		// Read bytecode size
+		asUINT bcSize;
+		file.seekg(fileSize - static_cast<std::streamsize>(NGT_BYTECODE_FILE_SIGNATURE_LEN + sizeof(asUINT)));
+		file.read(reinterpret_cast<char*>(&bcSize), sizeof(asUINT));
+		if (bcSize == 0 || file.gcount() != sizeof(asUINT)) return false;
+
+		std::streamsize expectedMinSize = static_cast<std::streamsize>(NGT_BYTECODE_FILE_SIGNATURE_LEN + sizeof(asUINT) + bcSize);
+		if (fileSize < expectedMinSize) return false;
+
+		outBytecode.resize(bcSize);
+		file.seekg(fileSize - static_cast<std::streamsize>(NGT_BYTECODE_FILE_SIGNATURE_LEN + sizeof(asUINT) + bcSize));
+		file.read(reinterpret_cast<char*>(outBytecode.data()), bcSize);
+		if (file.gcount() != static_cast<std::streamsize>(bcSize)) {
+			outBytecode.clear();
+			return false;
+		}
+		return true;
 #endif
 	}
 
-		if (g_Platform == "Windows") {
-			bundle += ".exe";
+	bool saveBytecodeToExecutableInternal(const std::string& targetPath, const std::vector<asBYTE>& bytecode) {
+		std::string hostExePath = get_exe_helper();
+		try {
+			std::filesystem::copy_file(hostExePath, targetPath);
 		}
-		std::filesystem::copy_file(main_exe.c_str(), bundle);
-		std::fstream file(bundle, std::ios::app | std::ios::binary);
+		catch (const std::filesystem::filesystem_error& e) {
+			std::cerr << "Error copying host executable: " << e.what() << std::endl;
+			return false;
+		}
+
+#ifdef _WIN32
+		std::wstring targetPathW(targetPath.begin(), targetPath.end());
+		HANDLE hUpdate = BeginUpdateResourceW(targetPathW.c_str(), FALSE);
+		if (hUpdate == nullptr) {
+			std::cerr << "BeginUpdateResource failed: " << GetLastError() << std::endl;
+			return false;
+		}
+		BOOL success = UpdateResourceW(hUpdate, NGT_BYTECODE_RESOURCE_TYPE_W, NGT_BYTECODE_RESOURCE_ID_W,
+			MAKELANGID(LANG_NEUTRAL, SUBLANG_NEUTRAL),
+			(LPVOID)bytecode.data(), (DWORD)bytecode.size());
+		if (!success) {
+			std::cerr << "UpdateResource failed: " << GetLastError() << std::endl;
+			EndUpdateResource(hUpdate, TRUE);
+			return false;
+		}
+		if (!EndUpdateResource(hUpdate, FALSE)) {
+			std::cerr << "EndUpdateResource failed: " << GetLastError() << std::endl;
+			return false;
+		}
+		return true;
+#else
+		std::ofstream file(targetPath, std::ios::binary | std::ios::app | std::ios::ate);
 		if (!file.is_open()) {
-			app->scriptEngine->WriteMessage(this_exe.c_str(), 0, 0, asMSGTYPE_ERROR, "Failed to open output file for writing");
-
-			show_message();
-			m_retcode = -1;
-			return;
+			std::cerr << "Failed to open target executable for appending: " << targetPath << std::endl;
+			return false;
 		}
-
-		file.seekg(0, std::ios::end);
-		long file_size = file.tellg();
-		file.write("\r\n.rdata", strlen("\r\n.rdata"));
-		crypt(buffer);
-		buffer = vector_encrypt(buffer, string_base64_encode(NGT_BYTECODE_ENCRYPTION_KEY));
-		file.write(reinterpret_cast<char*>(buffer.data()), buffer.size());
-		buffer_size = buffer.size();
-		file.write(reinterpret_cast<char*>(&buffer_size), sizeof(asUINT));
+		file.write(reinterpret_cast<const char*>(bytecode.data()), bytecode.size());
+		asUINT bcSize = static_cast<asUINT>(bytecode.size());
+		file.write(reinterpret_cast<const char*>(&bcSize), sizeof(asUINT));
+		file.write(NGT_BYTECODE_FILE_SIGNATURE, NGT_BYTECODE_FILE_SIGNATURE_LEN);
 		file.close();
-		module->Discard();
-
-}
-	void executeBytecode() {
-		SCRIPT_COMPILED = true;
-		// Execute the script
-		module = app->scriptEngine->GetModule(get_exe().c_str(), asGM_ALWAYS_CREATE);
-		int result;
-		module = app->scriptEngine->GetModule(get_exe().c_str());
-		if (module)
-		{
-			std::fstream read_file(this_exe.c_str(), std::ios::binary | std::ios::in);
-			if (read_file.is_open()) {
-				read_file.seekg(0, std::ios::end);
-				long file_size = read_file.tellg();
-				read_file.seekg(file_size - sizeof(asUINT));
-
-				read_file.read(reinterpret_cast<char*>(&buffer_size), sizeof(asUINT));
-
-				read_file.seekg(file_size - buffer_size - 4, std::ios::beg);
-				buffer.resize(buffer_size);
-				read_file.read(reinterpret_cast<char*>(buffer.data()), buffer_size);
-				buffer = vector_decrypt(buffer, string_base64_encode(NGT_BYTECODE_ENCRYPTION_KEY));
-
-				crypt(buffer);
-
-				read_file.close();
-			}
-			else {
-				app->scriptEngine->WriteMessage(this_exe.c_str(), 0, 0, asMSGTYPE_ERROR, "Failed to open output file for reading");
-
-				show_message();
-				m_retcode = -1;
-				return;
-			}
-
-
-			Load(app->scriptEngine, buffer);
-		}
-		asIScriptFunction* func = module->GetFunctionByName("main");
-		if (func == 0) {
-			std::cout << "Failed to invoke main." << std::endl;
-			m_retcode = 1;
-			return;
-		}
-		result = app->Exec(func);
-		m_retcode = result;
-		module->Discard();
+		return !file.fail();
+#endif
 	}
 
-	int main(const ArgVec& args)override
-	{
-		if (bytecodeExecute) {
-			executeBytecode();
-			return m_retcode;
-		}
-		return m_retcode;
-	}
 };
 
 #undef SDL_MAIN_HANDLED
 #undef SDL_main_h_
 #include <SDL3/SDL_main.h>
 
-
-int main(int argc, char** argv) {
+int main(int argc, char* argv[]) {
 #ifdef _WIN32
 	SetUnhandledExceptionFilter(ExceptionHandler);
 #else
-	struct sigaction action;
-	action.sa_sigaction = signalHandler;
-	action.sa_flags = SA_SIGINFO;
-
-	sigaction(SIGSEGV, &action, nullptr);
+	struct sigaction sa;
+	memset(&sa, 0, sizeof(sa));
+	sigemptyset(&sa.sa_mask);
+	sa.sa_sigaction = signalHandler;
+	sa.sa_flags = SA_SIGINFO;
+	sigaction(SIGSEGV, &sa, nullptr);
+	sigaction(SIGFPE, &sa, nullptr);
+	sigaction(SIGILL, &sa, nullptr);
 #endif
-	g_argc = argc - (scriptArg + 1);
-	g_argv = argv + (scriptArg + 1);
-	AutoPtr<Application> a = new NGTEntry();
+	AutoPtr<NGTEntry> pApp = new NGTEntry();
 	try {
-
-		a->init(argc, argv);
+		pApp->init(argc, argv);
 	}
-	catch (Poco::Exception& e) {
-		a->logger().fatal(e.displayText());
+	catch (Poco::Exception& exc) {
+		pApp->logger().log(exc);
 		return Application::EXIT_CONFIG;
 	}
-	return a->run();
+	return pApp->run();
 }
-int ExecSystemCmd(const string& str, string& out)
-{
+
+
+int ExecSystemCmd(const std::string& cmd) {
 #ifdef _WIN32
 	// Convert the command to UTF16 to properly handle unicode path names
 	wchar_t bufUTF16[10000];
-	MultiByteToWideChar(CP_UTF8, 0, str.c_str(), -1, bufUTF16, 10000);
+	MultiByteToWideChar(CP_UTF8, 0, cmd.c_str(), -1, bufUTF16, 10000);
+	return _wsystem(bufUTF16);
+#else
+	return system(cmd.c_str());
+#endif
+}
 
-	// Create a pipe to capture the stdout from the system command
+int ExecSystemCmd(const std::string& cmd, std::string& out) {
+	out = "";
+#ifdef _WIN32
+	wchar_t bufUTF16[10000]; // Potential buffer overflow if cmd is too long
+	MultiByteToWideChar(CP_UTF8, 0, cmd.c_str(), -1, bufUTF16, 10000);
+
 	HANDLE pipeRead, pipeWrite;
 	SECURITY_ATTRIBUTES secAttr = { 0 };
 	secAttr.nLength = sizeof(SECURITY_ATTRIBUTES);
 	secAttr.bInheritHandle = TRUE;
 	secAttr.lpSecurityDescriptor = NULL;
-	if (!CreatePipe(&pipeRead, &pipeWrite, &secAttr, 0))
-		return -1;
+	if (!CreatePipe(&pipeRead, &pipeWrite, &secAttr, 0)) return -1;
 
-	// Start the process for the system command, informing the pipe to 
-	// capture stdout, and also to skip showing the command window
 	STARTUPINFOW si = { 0 };
 	si.cb = sizeof(STARTUPINFOW);
 	si.dwFlags = STARTF_USESHOWWINDOW | STARTF_USESTDHANDLES;
 	si.hStdOutput = pipeWrite;
-	si.hStdError = pipeWrite;
+	si.hStdError = pipeWrite; // Capture stderr too
 	si.wShowWindow = SW_HIDE;
 	PROCESS_INFORMATION pi = { 0 };
-	BOOL success = CreateProcessW(NULL, bufUTF16, NULL, NULL, TRUE, CREATE_NEW_CONSOLE, NULL, NULL, &si, &pi);
-	if (!success)
-	{
+	BOOL success = CreateProcessW(NULL, bufUTF16, NULL, NULL, TRUE, 0 /*CREATE_NEW_CONSOLE removed, can cause issues*/, NULL, NULL, &si, &pi);
+	if (!success) {
 		CloseHandle(pipeWrite);
 		CloseHandle(pipeRead);
 		return -1;
 	}
+	CloseHandle(pipeWrite); // Close our copy of write end so ReadFile can detect EOF
 
-	// Run the command until the end, while capturing stdout
-	for (;;)
-	{
-		// Wait for a while to allow the process to work
-		DWORD ret = WaitForSingleObject(pi.hProcess, 50);
-
-		// Read from the stdout if there is any data
-		for (;;)
-		{
-			char buf[1024];
-			DWORD readCount = 0;
-			DWORD availCount = 0;
-
-			if (!::PeekNamedPipe(pipeRead, NULL, 0, NULL, &availCount, NULL))
-				break;
-
-			if (availCount == 0)
-				break;
-
-			if (!::ReadFile(pipeRead, buf, sizeof(buf) - 1 < availCount ? sizeof(buf) - 1 : availCount, &readCount, NULL) || !readCount)
-				break;
-
-			buf[readCount] = 0;
-			out += buf;
-		}
-
-		// End the loop if the process finished
-		if (ret == WAIT_OBJECT_0)
-			break;
+	char buffer[4096];
+	DWORD bytesRead;
+	while (ReadFile(pipeRead, buffer, sizeof(buffer) - 1, &bytesRead, NULL) && bytesRead > 0) {
+		buffer[bytesRead] = '\0';
+		out += buffer;
 	}
 
-	// Get the return status from the process
+	WaitForSingleObject(pi.hProcess, INFINITE);
 	DWORD status = 0;
 	GetExitCodeProcess(pi.hProcess, &status);
 
 	CloseHandle(pipeRead);
-	CloseHandle(pipeWrite);
 	CloseHandle(pi.hProcess);
 	CloseHandle(pi.hThread);
-
 	return status;
 #else
-	// TODO: Implement suppor for ExecSystemCmd(const string &, string&) on non-Windows platforms
-	asIScriptContext* ctx = asGetActiveContext();
-	if (ctx)
-		ctx->SetException("Oops! This is not yet implemented on non-Windows platforms. Sorry!\n");
-	return -1;
+	// Linux/macOS variant using popen
+	FILE* pipe = popen((cmd + " 2>&1").c_str(), "r"); // "2>&1" to redirect stderr to stdout
+	if (!pipe) return -1;
+	char buffer[128];
+	while (fgets(buffer, sizeof(buffer), pipe) != nullptr) {
+		out += buffer;
+	}
+	return pclose(pipe); // Returns termination status of command
 #endif
-}
-
-// This function simply calls the system command and returns the status
-// Return of -1 indicates an error. Else the return code is the return status of the executed command
-int ExecSystemCmd(const string& str)
-{
-	// Check if the command line processor is available
-	if (system(0) == 0)
-	{
-		asIScriptContext* ctx = asGetActiveContext();
-		if (ctx)
-			ctx->SetException("Command interpreter not available\n");
-		return -1;
-	}
-
-#ifdef _WIN32
-	// Convert the command to UTF16 to properly handle unicode path names
-	wchar_t bufUTF16[10000];
-	MultiByteToWideChar(CP_UTF8, 0, str.c_str(), -1, bufUTF16, 10000);
-	return _wsystem(bufUTF16);
-#else
-	return system(str.c_str());
-#endif
-}
-
-// This function returns the command line arguments that were passed to the script
-CScriptArray* GetCommandLineArgs()
-{
-	if (g_commandLineArgs)
-	{
-		g_commandLineArgs->AddRef();
-		return g_commandLineArgs;
-	}
-
-	// Obtain a pointer to the engine
-	asIScriptContext* ctx = asGetActiveContext();
-	asIScriptEngine* engine = ctx->GetEngine();
-
-	// Create the array object
-	asITypeInfo* arrayType = engine->GetTypeInfoById(engine->GetTypeIdByDecl("array<string>"));
-	g_commandLineArgs = CScriptArray::Create(arrayType, (asUINT)0);
-
-	// Find the existence of the delimiter in the input string
-	for (int n = 0; n < g_argc; n++)
-	{
-		// Add the arg to the array
-		g_commandLineArgs->Resize(g_commandLineArgs->GetSize() + 1);
-		((string*)g_commandLineArgs->At(n))->assign(g_argv[n]);
-	}
-
-	// Return the array by handle
-	g_commandLineArgs->AddRef();
-	return g_commandLineArgs;
 }
 

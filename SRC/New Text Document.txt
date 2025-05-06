@@ -1,0 +1,137 @@
+// SRAL NGT wrapper
+#include <SRAL.h>
+#include <angelscript.h>
+#include <Poco/RefCountedObject.h>
+#include <string>
+#include <scriptarray/scriptarray.h>
+
+
+
+class CSpeech : public Poco::RefCountedObject {
+public:
+    CSpeech(int excludes = 0) {
+        if (!SRAL_IsInitialized()) {
+            SRAL_Initialize(excludes);
+        }
+    }
+
+    ~CSpeech() {
+        if (SRAL_IsInitialized()) {
+            SRAL_Uninitialize();
+        }
+    }
+
+    static bool Speak(const std::string& text, bool interrupt = true) {
+        return SRAL_Speak(text.c_str(), interrupt);
+    }
+
+    static void* SpeakToMemory(const std::string& text, uint64_t* buffer_size, int* channels, 
+                       int* sample_rate, int* bits_per_sample) {
+        return SRAL_SpeakToMemory(text.c_str(), buffer_size, channels, sample_rate, bits_per_sample);
+    }
+
+    static bool SpeakSsml(const std::string& ssml, bool interrupt = true) {
+        return SRAL_SpeakSsml(ssml.c_str(), interrupt);
+    }
+
+    static bool Braille(const std::string& text) {
+        return SRAL_Braille(text.c_str());
+    }
+
+    static bool Output(const std::string& text, bool interrupt = true) {
+        return SRAL_Output(text.c_str(), interrupt);
+    }
+
+    static bool StopSpeech() {
+        return SRAL_StopSpeech();
+    }
+
+    static bool PauseSpeech() {
+        return SRAL_PauseSpeech();
+    }
+
+    static bool ResumeSpeech() {
+        return SRAL_ResumeSpeech();
+    }
+
+    static bool Speak(int engine, const std::string& text, bool interrupt = true) {
+        return SRAL_SpeakEx(engine, text.c_str(), interrupt);
+    }
+
+    static void* SpeakToMemory(int engine, const std::string& text, uint64_t* buffer_size, 
+                         int* channels, int* sample_rate, int* bits_per_sample) {
+        return SRAL_SpeakToMemoryEx(engine, text.c_str(), buffer_size, channels, 
+                                   sample_rate, bits_per_sample);
+    }
+
+    static bool SpeakSsml(int engine, const std::string& ssml, bool interrupt = true) {
+        return SRAL_SpeakSsmlEx(engine, ssml.c_str(), interrupt);
+    }
+
+    static bool Braille(int engine, const std::string& text) {
+        return SRAL_BrailleEx(engine, text.c_str());
+    }
+
+    static bool Output(int engine, const std::string& text, bool interrupt = true) {
+        return SRAL_OutputEx(engine, text.c_str(), interrupt);
+    }
+
+    static bool StopSpeech(int engine) {
+        return SRAL_StopSpeechEx(engine);
+    }
+
+    static bool PauseSpeech(int engine) {
+        return SRAL_PauseSpeechEx(engine);
+    }
+
+    static bool ResumeSpeech(int engine) {
+        return SRAL_ResumeSpeechEx(engine);
+    }
+
+    static int GetCurrentEngine() const {
+        return SRAL_GetCurrentEngine();
+    }
+
+    static int GetEngineFeatures(int engine = 0) {
+        return SRAL_GetEngineFeatures(engine);
+    }
+
+    static bool SetEngineParameter(int engine, int param, const void* value) {
+        return SRAL_SetEngineParameter(engine, param, value);
+    }
+
+    static bool GetEngineParameter(int engine, int param, void* value) {
+        return SRAL_GetEngineParameter(engine, param, value);
+    }
+
+    static void Delay(int time) {
+        SRAL_Delay(time);
+    }
+
+    static bool RegisterKeyboardHooks() {
+        return SRAL_RegisterKeyboardHooks();
+    }
+
+    static void UnregisterKeyboardHooks() {
+        SRAL_UnregisterKeyboardHooks();
+    }
+
+    static int GetAvailableEngines() const {
+        return SRAL_GetAvailableEngines();
+    }
+
+    static int GetActiveEngines() const {
+        return SRAL_GetActiveEngines();
+    }
+
+    static std::string GetEngineName(int engine) {
+        return SRAL_GetEngineName(engine);
+    }
+
+    static bool Initialized() const {
+        return SRAL_IsInitialized();
+    }
+};
+
+// Initialize speech system
+static CSpeech g_Speech;
